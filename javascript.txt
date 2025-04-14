@@ -1,0 +1,970 @@
+ <!-- JavaScript Kód -->
+  <script>
+    (function() { // IIFE Start - Encapsulation
+        'use strict';
+
+        // --- Konfiguráció és Konstansok ---
+        const CONFIG = {
+            LOCALSTORAGE_KEY: 'slideEditorPresentation_v1', // Added versioning
+            DEFAULT_TITLE: "Névtelen Prezentáció",
+            DEFAULT_BG_COLOR: '#FFFFFF',
+            ZOOM_MIN: 0.1,
+            ZOOM_MAX: 3.0,
+            ZOOM_STEP: 0.1,
+            DEBOUNCE_DELAY: 350 // Slightly increased delay
+        };
+
+        // --- Állapotkezelés ---
+        const editorState = {
+            presentationTitle: CONFIG.DEFAULT_TITLE,
+            slides: [],
+            selectedSlideId: null,
+            currentZoom: 1.0,
+            lastSaved: null,
+            isDirty: false, // Track unsaved changes
+            history: [], // TODO: Implement history stack
+        };
+
+        // --- DOM Elemek Referenciái (Cache) ---
+        const DOM = {}; // Cache object
+
+        // --- Segédfüggvények ---
+        function formatTimestamp(timestamp) {
+            if (!timestamp) return 'még nem mentve';
+            try {
+                const date = new Date(timestamp);
+                // Check if date is valid before formatting
+                if (isNaN(date.getTime())) return 'érvénytelen dátum';
+                return date.toLocaleTimeString('hu-HU', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+            } catch (e) {
+                console.error("Error formatting timestamp:", e);
+                return 'formázási hiba';
+            }
+        }
+
+        function updateLastEditedStatus(timestamp = editorState.lastSaved) {
+            if (DOM.presentationLastEdited) {
+                DOM.presentationLastEdited.textContent = `Mentve: ${formatTimestamp(timestamp)}`;
+            }
+            // Update save button state (e.g., disable if not dirty)
+            if (DOM.saveButton) {
+                DOM.saveButton.disabled = !editorState.isDirty;
+                // Optionally change text back from "Mentve!" if it was showing that
+                if (!editorState.isDirty && DOM.saveButton.textContent === 'Mentve!') {
+                    DOM.saveButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-1.5" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>Mentés`;
+                }
+            }
+        }
+
+        function generateUniqueId(prefix = 'id') {
+            return `${prefix}-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+        }
+
+        function getContrastColor(hexcolor) {
+            try {
+                if (!hexcolor || typeof hexcolor !== 'string') return '#000000';
+                hexcolor = hexcolor.replace("#", "");
+                if (hexcolor.length === 3) hexcolor = hexcolor.split('').map(hex => hex + hex).join('');
+                if (hexcolor.length !== 6) return '#000000'; // Invalid hex length
+
+                const r = parseInt(hexcolor.substring(0, 2), 16);
+                const g = parseInt(hexcolor.substring(2, 4), 16);
+                const b = parseInt(hexcolor.substring(4, 6), 16);
+                 // Check if parsing was successful
+                 if (isNaN(r) || isNaN(g) || isNaN(b)) return '#000000';
+
+                const yiq = ((r * 299) + (g * 587) + (b * 114)) / 1000;
+                return (yiq >= 128) ? '#000000' : '#FFFFFF';
+            } catch (e) {
+                console.error("Error calculating contrast color:", e);
+                return '#000000'; // Fallback
+            }
+        }
+
+        // Debounce Function
+        let debounceTimeout;
+        function debounce(func, delay) {
+            return (...args) => {
+                clearTimeout(debounceTimeout);
+                debounceTimeout = setTimeout(() => func.apply(this, args), delay);
+            };
+        }
+
+        function markDirty(isUnsaved = true) {
+            if (editorState.isDirty !== isUnsaved) {
+                editorState.isDirty = isUnsaved;
+                // Update save button state visually
+                if (DOM.saveButton) {
+                     DOM.saveButton.disabled = !isUnsaved;
+                    // Add visual cue? e.g., subtle glow or color change
+                    // DOM.saveButton.classList.toggle('needs-saving', isUnsaved);
+                 }
+                // Update window title (optional)
+                 document.title = `${editorState.presentationTitle}${isUnsaved ? '*' : ''} - Szerkesztő`;
+            }
+        }
+
+        // --- Dia Struktúra és Létrehozás ---
+        function createDefaultSlide() {
+            const newId = generateUniqueId('slide');
+            return [{
+                id: newId,
+                title: 'Cím dia',
+                subtitle: 'Alcím hozzáadása',
+                content: '',
+                elements: [],
+                layout: 'title_subtitle',
+                backgroundColor: CONFIG.DEFAULT_BG_COLOR
+            }];
+        }
+
+        function createNewSlide() {
+            const newId = generateUniqueId('slide');
+            return {
+                id: newId,
+                title: `Dia ${editorState.slides.length + 1}`,
+                subtitle: '',
+                content: '<p>Kezdj el gépelni...</p>',
+                elements: [],
+                layout: 'title_content',
+                backgroundColor: CONFIG.DEFAULT_BG_COLOR
+            };
+        }
+
+        // --- Renderelő Függvények ---
+        function renderSidebar() {
+            if (!DOM.slideList) return;
+            // Use textContent for slightly faster clearing
+            DOM.slideList.textContent = '';
+
+            if (editorState.slides.length === 0) {
+                DOM.slideList.innerHTML = `<p class="text-center text-editor-muted text-sm p-4">Nincsenek diák. Adj hozzá egyet!</p>`;
+                return;
+            }
+
+            // DocumentFragment for batch DOM insertion
+            const fragment = document.createDocumentFragment();
+
+            editorState.slides.forEach((slide, index) => {
+                const isSelected = slide.id === editorState.selectedSlideId;
+                const item = document.createElement('div');
+                // Use template literals for cleaner class definition
+                item.className = `slide-item group flex items-center space-x-2 p-1.5 rounded-md hover:bg-editor-light cursor-pointer`;
+                item.setAttribute('role', 'option');
+                item.setAttribute('aria-selected', isSelected.toString());
+                item.setAttribute('tabindex', '0');
+                item.setAttribute('aria-labelledby', `slide-title-label-${slide.id}`);
+                item.dataset.slideId = slide.id; // Use dataset
+
+                if (isSelected) {
+                    item.style.borderColor = '#4a80f5';
+                    item.style.backgroundColor = 'rgba(74, 128, 245, 0.15)';
+                    item.setAttribute('aria-current', 'true');
+                }
+
+                // Inner structure using template literals for readability
+                item.innerHTML = `
+                    <span class="text-xs w-4 text-right text-editor-muted flex-shrink-0 ${isSelected ? 'font-semibold' : ''}" aria-hidden="true">${index + 1}</span>
+                    <div class="w-20 h-12 rounded-sm slide-preview border border-editor-divider flex-shrink-0" aria-hidden="true" style="background-color: ${slide.backgroundColor || CONFIG.DEFAULT_BG_COLOR}; color: ${getContrastColor(slide.backgroundColor || CONFIG.DEFAULT_BG_COLOR)};">
+                        ${slide.title.substring(0, 10) || "Üres"}
+                    </div>
+                    <span id="slide-title-label-${slide.id}" class="text-sm flex-1 truncate pr-1 ${isSelected ? 'font-medium' : ''}">${slide.title || 'Névtelen dia'}</span>
+                    <button class="delete-slide-button opacity-0 group-hover:opacity-100 focus:opacity-100 p-0.5 hover:bg-gray-700 rounded action-button flex-shrink-0" title="Dia ${index + 1} törlése" aria-label="Dia ${index + 1} törlése" tabindex="-1" data-slide-id="${slide.id}">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-red-400 pointer-events-none" aria-hidden="true"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                    </button>
+                `;
+
+                fragment.appendChild(item);
+
+                if (isSelected && document.activeElement !== item) {
+                    // Schedule scrollIntoView after elements are in the DOM
+                    setTimeout(() => item.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 0);
+                }
+            });
+
+            DOM.slideList.appendChild(fragment); // Append fragment once
+            updateNavigationButtons();
+        }
+
+        function renderCanvas() {
+            if (!DOM.slideCanvas) return;
+            const selectedSlide = editorState.slides.find(s => s.id === editorState.selectedSlideId);
+
+            if (!selectedSlide) {
+                DOM.slideCanvas.innerHTML = `<div class="flex items-center justify-center h-full"><p class="text-gray-400">Válassz ki vagy hozz létre egy diát.</p></div>`;
+                if(DOM.canvasHeading) DOM.canvasHeading.textContent = "Dia szerkesztése";
+                return;
+            }
+
+            DOM.slideCanvas.style.backgroundColor = selectedSlide.backgroundColor || CONFIG.DEFAULT_BG_COLOR;
+            // Using innerHTML here as layout logic can be complex. Optimization could involve updating only changed parts.
+            DOM.slideCanvas.innerHTML = `
+                <h2 id="canvas-heading" class="sr-only">Dia szerkesztése: ${selectedSlide.title || 'Névtelen dia'}</h2>
+                <label for="slide-title-input" class="sr-only">Dia Címe</label>
+                <input type="text" id="slide-title-input" value="${selectedSlide.title || ''}" placeholder="Cím hozzáadása" class="canvas-input w-full text-3xl md:text-4xl lg:text-5xl font-bold mb-2 md:mb-4 outline-none border-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 rounded px-2 py-1 bg-transparent placeholder-gray-400 flex-shrink-0" data-field="title">
+                <label for="slide-subtitle-input" class="sr-only">Dia Alcíme</label>
+                <input type="text" id="slide-subtitle-input" value="${selectedSlide.subtitle || ''}" placeholder="Alcím hozzáadása" class="canvas-input w-full text-lg md:text-xl lg:text-2xl text-gray-600 outline-none border-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 rounded px-2 py-1 bg-transparent placeholder-gray-400 flex-shrink-0" data-field="subtitle">
+                <div id="slide-content-editor" role="textbox" aria-multiline="true" aria-label="Dia tartalma" class="canvas-input mt-6 md:mt-8 text-base md:text-lg lg:text-xl outline-none border-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 rounded px-2 py-1 min-h-[100px] flex-1 overflow-y-auto bg-transparent" contenteditable="true" placeholder="Tartalom hozzáadása..." data-field="content">
+                    ${selectedSlide.content || ''}
+                </div>
+                <button id="add-element-button" class="absolute bottom-4 right-4 flex items-center px-3 py-1.5 text-xs text-white bg-gray-700 hover:bg-gray-800 rounded-md action-button" aria-label="Elem hozzáadása a diához">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-1" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                    Elem hozzáadása
+                </button>`;
+
+            // Re-cache canvas elements and bind listeners after innerHTML rewrite
+            cacheCanvasElements();
+            updateNavigationButtons();
+            updateToolbarState(); // Update toolbar based on the new content/selection
+        }
+
+        function cacheCanvasElements() {
+             // Cache elements inside the canvas after it's rendered
+            DOM.canvasHeading = document.getElementById('canvas-heading');
+            DOM.slideTitleInput = document.getElementById('slide-title-input');
+            DOM.slideSubtitleInput = document.getElementById('slide-subtitle-input');
+            DOM.slideContentEditor = document.getElementById('slide-content-editor');
+        }
+
+
+        function updateToolbarState() {
+            if (!document.queryCommandState || !DOM.toolbarButtons) return;
+
+            DOM.toolbarButtons.forEach(button => {
+                const command = button.dataset.command;
+                if (!command) return; // Skip buttons without command
+
+                let isActive = false;
+                let value = null;
+
+                try {
+                    if (document.queryCommandEnabled(command)) {
+                        if (['bold', 'italic', 'underline', 'strikeThrough', 'insertOrderedList', 'insertUnorderedList'].includes(command)) {
+                            isActive = document.queryCommandState(command);
+                        } else if (['justifyLeft', 'justifyCenter', 'justifyRight', 'justifyFull'].includes(command)) {
+                             isActive = document.queryCommandState(command);
+                            // For alignment, only one can be active. We might need extra logic
+                            // if multiple buttons represent the same state group.
+                            // Currently, we assume the browser handles the 'pressed' state correctly.
+                        }
+                         // For commands that return values (like fontName, fontSize, foreColor)
+                         // let currentValue = document.queryCommandValue(command);
+                         // TODO: Update dropdowns/color pickers based on currentValue
+                    }
+                } catch (e) {
+                    // Ignore errors, e.g., command not supported
+                }
+
+                button.setAttribute('aria-pressed', isActive.toString());
+                 // Use a specific class for visual state instead of reusing hover/focus style
+                 button.classList.toggle('active', isActive);
+            });
+        }
+
+        function updateNavigationButtons() {
+            if (!DOM.prevSlideButton || !DOM.nextSlideButton || !DOM.slideIndicator) return;
+            const currentIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+            const totalSlides = editorState.slides.length;
+
+            if (currentIndex === -1 || totalSlides === 0) {
+                DOM.prevSlideButton.disabled = true; DOM.nextSlideButton.disabled = true;
+                DOM.slideIndicator.textContent = `Dia - / -`;
+            } else {
+                DOM.prevSlideButton.disabled = currentIndex === 0;
+                DOM.nextSlideButton.disabled = currentIndex === totalSlides - 1;
+                DOM.slideIndicator.textContent = `Dia ${currentIndex + 1} / ${totalSlides}`;
+            }
+        }
+
+
+        // --- Műveleti Függvények ---
+        function selectSlide(slideId) {
+            if (editorState.selectedSlideId !== slideId) {
+                console.log(`selectSlide: ${slideId}`);
+                editorState.selectedSlideId = slideId;
+                 markDirty(); // Selecting a different slide might imply potential changes
+                renderSidebar();
+                renderCanvas();
+            }
+        }
+
+        function addSlide() {
+            console.log("addSlide()");
+            const newSlide = createNewSlide();
+            // Add after the current slide, or at the end if none selected
+            const currentIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+            const insertIndex = (currentIndex === -1) ? editorState.slides.length : currentIndex + 1;
+            editorState.slides.splice(insertIndex, 0, newSlide);
+
+            editorState.selectedSlideId = newSlide.id;
+            markDirty();
+            renderSidebar();
+            renderCanvas();
+        }
+
+        function deleteSlide(slideId) {
+            console.log(`deleteSlide: ${slideId}`);
+            const slideIndex = editorState.slides.findIndex(s => s.id === slideId);
+            if (slideIndex === -1) return;
+
+            // Prevent deleting the last slide? Or replace with a blank one?
+            // For now, allow deleting the last one.
+            // if (editorState.slides.length === 1) {
+            //     alert("Nem törölheted az utolsó diát.");
+            //     return;
+            // }
+
+            if (confirm(`Biztosan törölni szeretnéd ezt a diát (${editorState.slides[slideIndex].title || 'Névtelen dia'})?`)) {
+                const wasSelected = editorState.selectedSlideId === slideId;
+                editorState.slides.splice(slideIndex, 1);
+                markDirty();
+
+                if (wasSelected) {
+                    if (editorState.slides.length > 0) {
+                        const newIndex = Math.min(slideIndex, editorState.slides.length - 1);
+                        editorState.selectedSlideId = editorState.slides[newIndex].id;
+                    } else {
+                        editorState.selectedSlideId = null;
+                    }
+                }
+                renderSidebar();
+                renderCanvas();
+            }
+        }
+
+        function findNextSlideId() {
+             const currentIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+             if (currentIndex !== -1 && currentIndex < editorState.slides.length - 1) return editorState.slides[currentIndex + 1].id;
+             return null;
+         }
+         function findPreviousSlideId() {
+             const currentIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+             if (currentIndex > 0) return editorState.slides[currentIndex - 1].id;
+             return null;
+         }
+         function navigateSlides(direction) {
+            let nextId = direction === 'next' ? findNextSlideId() : findPreviousSlideId();
+            if (nextId) selectSlide(nextId);
+         }
+
+        // --- Mentés / Betöltés ---
+        function savePresentation() {
+            console.log('Mentés...');
+            // Explicitly get current values from canvas inputs before saving
+            const currentSlideIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+            if (currentSlideIndex !== -1 && DOM.slideTitleInput && DOM.slideSubtitleInput && DOM.slideContentEditor) {
+                editorState.slides[currentSlideIndex].title = DOM.slideTitleInput.value;
+                editorState.slides[currentSlideIndex].subtitle = DOM.slideSubtitleInput.value;
+                editorState.slides[currentSlideIndex].content = DOM.slideContentEditor.innerHTML;
+            }
+
+            try {
+                const dataToSave = {
+                    presentationTitle: editorState.presentationTitle,
+                    slides: editorState.slides,
+                    selectedSlideId: editorState.selectedSlideId,
+                    // Save lastSaved time *within* the data
+                    savedTimestamp: Date.now()
+                };
+                localStorage.setItem(CONFIG.LOCALSTORAGE_KEY, JSON.stringify(dataToSave));
+                editorState.lastSaved = dataToSave.savedTimestamp; // Update state
+                markDirty(false); // Mark as saved
+                updateLastEditedStatus(); // Update UI status
+
+                const originalContent = DOM.saveButton.innerHTML;
+                DOM.saveButton.innerHTML = 'Mentve!'; DOM.saveButton.disabled = true;
+                setTimeout(() => {
+                    // Restore only if still saved (not dirty again)
+                    if (!editorState.isDirty) {
+                        DOM.saveButton.innerHTML = originalContent;
+                        DOM.saveButton.disabled = true; // Still disabled as it's saved
+                    }
+                }, 1500);
+                console.log('Mentés sikeres.');
+            } catch (error) {
+                console.error('Mentési hiba:', error);
+                alert('Hiba történt a prezentáció mentése közben. A böngésző tárhelye betelhetett.');
+            }
+        }
+
+        function loadPresentation() {
+            console.log('Prezentáció betöltése...');
+            const savedData = localStorage.getItem(CONFIG.LOCALSTORAGE_KEY);
+            if (savedData) {
+                try {
+                    const loadedData = JSON.parse(savedData);
+                    editorState.presentationTitle = loadedData.presentationTitle || CONFIG.DEFAULT_TITLE;
+                    editorState.slides = loadedData.slides && loadedData.slides.length > 0 ? loadedData.slides : createDefaultSlide();
+                    editorState.selectedSlideId = loadedData.selectedSlideId;
+                    editorState.lastSaved = loadedData.savedTimestamp || null; // Load saved time
+
+                    // Validate selectedSlideId
+                    if (!editorState.slides.find(s => s.id === editorState.selectedSlideId) && editorState.slides.length > 0) {
+                        editorState.selectedSlideId = editorState.slides[0].id;
+                    }
+                    console.log('Prezentáció betöltve.');
+                } catch (error) {
+                    console.error('Betöltési hiba (hibás adat):', error);
+                    localStorage.removeItem(CONFIG.LOCALSTORAGE_KEY);
+                    initializeDefaultState();
+                    alert("Hiba történt a mentett prezentáció betöltésekor. Az alapértelmezett állapot lett visszaállítva.");
+                }
+            } else {
+                console.log('Nincs mentett prezentáció, alapértelmezett betöltése.');
+                initializeDefaultState();
+            }
+            // Initial render after load or init
+            if (DOM.presentationTitle) DOM.presentationTitle.textContent = editorState.presentationTitle;
+            markDirty(false); // Start clean after load
+            updateLastEditedStatus();
+            renderSidebar();
+            renderCanvas(); // Render canvas after state is loaded
+        }
+
+        function initializeDefaultState() {
+            editorState.presentationTitle = CONFIG.DEFAULT_TITLE;
+            editorState.slides = createDefaultSlide();
+            editorState.selectedSlideId = editorState.slides[0].id;
+            editorState.lastSaved = null;
+        }
+
+        // --- UI Műveletek (Modal, Dropdown, stb.) ---
+        function showShareModal() {
+            const mockUrl = window.location.href;
+            if (DOM.shareUrlInput) DOM.shareUrlInput.value = mockUrl;
+            if (DOM.shareModal) DOM.shareModal.classList.remove('hidden');
+            if (DOM.copyShareUrlButton) DOM.copyShareUrlButton.textContent = 'Másolás';
+        }
+        function hideShareModal() { if (DOM.shareModal) DOM.shareModal.classList.add('hidden'); }
+        function copyShareUrl() {
+            if (!navigator.clipboard) { alert("Böngésző nem támogatja a vágólapra másolást."); return; }
+            if (DOM.shareUrlInput) {
+                navigator.clipboard.writeText(DOM.shareUrlInput.value)
+                    .then(() => { if(DOM.copyShareUrlButton) DOM.copyShareUrlButton.textContent = 'Másolva!'; setTimeout(() => { if(DOM.copyShareUrlButton) DOM.copyShareUrlButton.textContent = 'Másolás'; }, 2000); })
+                    .catch(err => { console.error('Másolási hiba:', err); alert('Nem sikerült a vágólapra másolni.'); });
+            }
+        }
+
+        function toggleMoreOptions() {
+            if(DOM.moreOptionsDropdown) {
+                DOM.moreOptionsDropdown.classList.toggle('hidden');
+                const isExpanded = !DOM.moreOptionsDropdown.classList.contains('hidden');
+                if(DOM.moreOptionsButton) DOM.moreOptionsButton.setAttribute('aria-expanded', isExpanded.toString());
+            }
+        }
+
+        // --- Prezentációs Mód ---
+        function startPresentation() {
+            if(editorState.slides.length === 0 || !editorState.selectedSlideId) { alert("Nincs kiválasztott dia a bemutatáshoz."); return; }
+            console.log('Bemutatás indítása...');
+            document.body.classList.add('presentation-mode');
+            try { // Try entering fullscreen
+                if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen();
+            } catch (e) { console.warn("Fullscreen request failed:", e); }
+            document.addEventListener('keydown', handlePresentationKeys);
+            document.addEventListener('fullscreenchange', handleFullscreenChange);
+            updateFullscreenButtonIcon(true);
+            renderCanvas(); // Re-render for presentation mode if needed
+        }
+        function exitPresentation() {
+            console.log('Bemutatás bezárása...');
+            document.body.classList.remove('presentation-mode');
+            try { // Try exiting fullscreen
+                 if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+            } catch (e) { console.warn("Exit fullscreen failed:", e); }
+            // Clean up listeners regardless of fullscreen success/failure
+            document.removeEventListener('keydown', handlePresentationKeys);
+            document.removeEventListener('fullscreenchange', handleFullscreenChange);
+            updateFullscreenButtonIcon(false);
+            renderCanvas(); // Re-render for editor mode
+        }
+        function handlePresentationKeys(event) {
+            // Allow default behavior if modifier keys are pressed (except Shift+Space for previous)
+            if (event.ctrlKey || event.metaKey || event.altKey) {
+                if (!(event.shiftKey && event.key === ' ')) return; // Allow Shift+Space
+            }
+
+            switch (event.key) {
+                case 'ArrowRight': case 'PageDown': case ' ':
+                    if (!event.shiftKey) { // Space goes forward, Shift+Space goes back
+                        event.preventDefault(); navigateSlides('next');
+                    }
+                    break;
+                case 'ArrowLeft': case 'PageUp': case 'Backspace':
+                    event.preventDefault(); navigateSlides('prev');
+                    break;
+                case 'Escape': case 'q': case 'Q':
+                    event.preventDefault(); exitPresentation();
+                    break;
+                case 'f': case 'F':
+                    event.preventDefault(); toggleFullscreen();
+                    break;
+                // Add Home/End key support
+                case 'Home':
+                    event.preventDefault();
+                    if (editorState.slides.length > 0) selectSlide(editorState.slides[0].id);
+                    break;
+                case 'End':
+                    event.preventDefault();
+                    if (editorState.slides.length > 0) selectSlide(editorState.slides[editorState.slides.length - 1].id);
+                    break;
+            }
+            // Handle Shift+Space for previous slide
+            if (event.shiftKey && event.key === ' ') {
+                 event.preventDefault(); navigateSlides('prev');
+             }
+        }
+        function handleFullscreenChange() {
+            const isFullscreen = !!document.fullscreenElement;
+            updateFullscreenButtonIcon(isFullscreen);
+            if (!isFullscreen && document.body.classList.contains('presentation-mode')) {
+                console.log('Exiting presentation mode due to fullscreen exit.');
+                // Ensure listeners are removed and mode is exited
+                 document.body.classList.remove('presentation-mode');
+                 document.removeEventListener('keydown', handlePresentationKeys);
+                 document.removeEventListener('fullscreenchange', handleFullscreenChange);
+                 renderCanvas();
+            }
+        }
+        function updateFullscreenButtonIcon(isFullscreen) {
+             if (DOM.fullscreenEnterIcon && DOM.fullscreenExitIcon) {
+                DOM.fullscreenEnterIcon.classList.toggle('hidden', isFullscreen);
+                DOM.fullscreenExitIcon.classList.toggle('hidden', !isFullscreen);
+             }
+        }
+        function toggleFullscreen() {
+             try {
+                 if (!document.fullscreenElement) {
+                     // Prefer fullscreen on the main content area or the whole element
+                     const elementToFullscreen = document.body.classList.contains('presentation-mode')
+                         ? document.documentElement
+                         : DOM.mainContentArea || document.documentElement; // Fallback to documentElement
+                     if (elementToFullscreen.requestFullscreen) {
+                         elementToFullscreen.requestFullscreen();
+                     } else {
+                         console.warn("Fullscreen API not fully supported on this element.");
+                     }
+                 } else {
+                     if (document.exitFullscreen) document.exitFullscreen();
+                 }
+             } catch (e) {
+                 console.error("Fullscreen toggle error:", e);
+             }
+         }
+
+        // --- Letöltés ---
+        function downloadPresentation() {
+            console.log('Letöltés (JSON)...');
+            savePresentation(); // Ensure latest data is saved before download
+            try {
+                const dataToDownload = {
+                    presentationTitle: editorState.presentationTitle,
+                    slides: editorState.slides,
+                    savedTimestamp: editorState.lastSaved // Include last saved time
+                };
+                const jsonData = JSON.stringify(dataToDownload, null, 2);
+                const blob = new Blob([jsonData], { type: 'application/json;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                // Sanitize filename
+                const filename = (editorState.presentationTitle || 'prezentacio')
+                                  .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+                                  .replace(/[^a-z0-9\s-]/gi, '').trim().replace(/\s+/g, '_').toLowerCase();
+                a.download = `${filename || 'prezentacio'}.json`;
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                console.log('JSON letöltés elindítva.');
+            } catch (error) { console.error('Letöltési hiba:', error); alert('Hiba történt a prezentáció JSON letöltése közben.'); }
+        }
+
+        // --- Zoom ---
+        function applyZoom() {
+            if (DOM.canvasScaler) {
+                 if (editorState.currentZoom === 'fit') {
+                    // Basic fit logic (can be improved)
+                    const mainRect = DOM.mainContentArea.getBoundingClientRect();
+                    const canvasRect = DOM.slideCanvas.getBoundingClientRect(); // Get original size
+                     // Calculate scale based on width and height ratios, choose the smaller one
+                     // Subtract padding/margins if necessary
+                    const scaleX = (mainRect.width - 64) / 960; // Assuming 960px base width and some padding (32px*2)
+                    const scaleY = (mainRect.height - 96) / 540; // Assuming 540px base height and some padding (48px*2 + bottom bar)
+                    const scale = Math.min(scaleX, scaleY, 1.5); // Limit max fit zoom
+                     console.log(`Fit Zoom Calculated: ${scale.toFixed(2)}`);
+                    DOM.canvasScaler.style.transform = `scale(${scale})`;
+
+                 } else {
+                    DOM.canvasScaler.style.transform = `scale(${editorState.currentZoom})`;
+                 }
+            }
+            if (DOM.zoomLevelSelect) {
+                // Update select value
+                 const currentZoomValue = editorState.currentZoom === 'fit' ? 'fit' : editorState.currentZoom.toFixed(2);
+                 let foundOption = false;
+                 Array.from(DOM.zoomLevelSelect.options).forEach(opt => {
+                     const optionValue = opt.value === 'fit' ? 'fit' : parseFloat(opt.value).toFixed(2);
+                     if (optionValue === currentZoomValue) {
+                         DOM.zoomLevelSelect.value = opt.value;
+                         foundOption = true;
+                     }
+                 });
+                 // If exact value not found (e.g., from +/- buttons), maybe select closest or leave as is
+                 if (!foundOption && editorState.currentZoom !== 'fit') {
+                     console.log(`Zoom level ${editorState.currentZoom.toFixed(2)} not in options.`);
+                     // Optionally set to the numeric value if it exists, or handle differently
+                      // DOM.zoomLevelSelect.value = ''; // Or select closest?
+                 }
+            }
+        }
+        function changeZoom(delta) {
+             const currentNumericZoom = (typeof editorState.currentZoom === 'number') ? editorState.currentZoom : 1.0;
+             let newZoom = parseFloat((currentNumericZoom + delta).toFixed(2)); // Round to 2 decimal places
+             newZoom = Math.max(CONFIG.ZOOM_MIN, Math.min(CONFIG.ZOOM_MAX, newZoom));
+             editorState.currentZoom = newZoom;
+             applyZoom();
+             markDirty();
+         }
+         function setZoom(value) {
+            if (value === 'fit') {
+                editorState.currentZoom = 'fit';
+            } else {
+                editorState.currentZoom = parseFloat(value);
+            }
+            applyZoom();
+             markDirty(); // Changing zoom might be considered a change to save (if layout depends on it)
+        }
+
+        // --- Eszköztár Műveletek ---
+        function handleToolbarCommand(event) {
+            const button = event.currentTarget;
+            const command = button.dataset.command;
+            if (!command) return;
+
+            console.log(`Executing command: ${command}`);
+            let value = null; // For commands needing a value
+
+             // Focus the editor if possible/needed before executing command
+             if (DOM.slideContentEditor && document.activeElement !== DOM.slideContentEditor) {
+                // DOM.slideContentEditor.focus(); // Focusing might clear selection, be careful
+             }
+
+            try {
+                if (command === 'foreColor' || command === 'backColor') {
+                    // Placeholder: Replace with actual color picker UI interaction
+                    value = prompt(`Adj meg egy színt (pl. #FF0000 vagy red) a ${command === 'foreColor' ? 'szöveghez' : 'kiemeléshez'}:`);
+                    if (!value) return; // User cancelled
+                } else if (command === 'fontName') {
+                    // Placeholder: Replace with font dropdown UI interaction
+                    value = prompt("Add meg a betűtípust (pl. Arial, Verdana):");
+                    if (!value) return;
+                } else if (command === 'fontSize') {
+                     // Placeholder: Replace with font size UI interaction
+                     // Using execCommand for fontSize is tricky (1-7 scale). Better to use Selection API + spans.
+                     console.warn("fontSize using execCommand is limited. Implement using Selection API.");
+                     value = prompt("Add meg a méretet (1-7):", "3");
+                     if (!value || isNaN(parseInt(value)) || parseInt(value) < 1 || parseInt(value) > 7) {
+                        alert("Érvénytelen méret (1-7).");
+                        return;
+                     }
+                 }
+                 // Execute the command
+                document.execCommand(command, false, value);
+
+                markDirty(); // Formatting is an unsaved change
+                updateToolbarState(); // Update button states after execution
+
+                // Refocus editor after command execution (might be needed)
+                if (DOM.slideContentEditor) DOM.slideContentEditor.focus();
+
+            } catch (error) {
+                console.error(`Hiba a parancs (${command}) végrehajtása közben:`, error);
+                alert(`Hiba történt: ${error.message}`);
+            }
+        }
+
+        // --- Eseménykezelők Beállítása ---
+        function setupEventListeners() {
+            // Title Editing
+            if (DOM.presentationTitle) {
+                DOM.presentationTitle.addEventListener('click', handleTitleClick);
+                DOM.presentationTitle.addEventListener('blur', handleTitleBlur);
+                DOM.presentationTitle.addEventListener('keydown', handleTitleKeydown);
+            }
+            // Header Buttons
+            if (DOM.saveButton) DOM.saveButton.addEventListener('click', savePresentation);
+            if (DOM.shareButton) DOM.shareButton.addEventListener('click', showShareModal);
+            if (DOM.presentButton) DOM.presentButton.addEventListener('click', startPresentation);
+            if (DOM.downloadButton) DOM.downloadButton.addEventListener('click', downloadPresentation);
+            if (DOM.moreOptionsButton) DOM.moreOptionsButton.addEventListener('click', toggleMoreOptions);
+            // Sidebar Buttons / List (Delegation)
+            if (DOM.addSlideButton) DOM.addSlideButton.addEventListener('click', addSlide);
+            if (DOM.slideList) DOM.slideList.addEventListener('click', handleSlideListClick);
+            if (DOM.slideList) DOM.slideList.addEventListener('keydown', handleSlideListKeydown); // For keyboard access
+            // Toolbar Buttons (Delegation)
+             if (DOM.editorToolbar) DOM.editorToolbar.addEventListener('click', handleToolbarClick);
+            // Bottom Bar Buttons
+            if (DOM.prevSlideButton) DOM.prevSlideButton.addEventListener('click', () => navigateSlides('prev'));
+            if (DOM.nextSlideButton) DOM.nextSlideButton.addEventListener('click', () => navigateSlides('next'));
+            if (DOM.zoomOutButton) DOM.zoomOutButton.addEventListener('click', () => changeZoom(-CONFIG.ZOOM_STEP));
+            if (DOM.zoomInButton) DOM.zoomInButton.addEventListener('click', () => changeZoom(CONFIG.ZOOM_STEP));
+            if (DOM.zoomLevelSelect) DOM.zoomLevelSelect.addEventListener('change', (e) => setZoom(e.target.value));
+            if (DOM.fullscreenButton) DOM.fullscreenButton.addEventListener('click', toggleFullscreen);
+            // Modal/Dropdown Interactions
+            if (DOM.closeShareModalButton) DOM.closeShareModalButton.addEventListener('click', hideShareModal);
+            if (DOM.copyShareUrlButton) DOM.copyShareUrlButton.addEventListener('click', copyShareUrl);
+            if (DOM.shareModal) DOM.shareModal.addEventListener('click', (e) => { if (e.target === DOM.shareModal) hideShareModal(); }); // Close on backdrop click
+            if (DOM.renameOption) DOM.renameOption.addEventListener('click', handleRenameClick);
+            if (DOM.duplicateOption) DOM.duplicateOption.addEventListener('click', handleDuplicateClick);
+            // Close dropdown on outside click
+            document.addEventListener('click', handleOutsideDropdownClick);
+            // Keyboard Shortcuts
+            document.addEventListener('keydown', handleGlobalKeydown);
+            // Update toolbar state on selection change
+             document.addEventListener('selectionchange', debounce(updateToolbarState, 100)); // Debounce selection change slightly
+             // Also update on focus/click/keyup within the content editor (handled via delegation now)
+             if (DOM.slideCanvas) { // Need to attach to canvas as editor itself is dynamic
+                 DOM.slideCanvas.addEventListener('focusin', handleCanvasFocusIn); // Use focusin for delegation
+                 DOM.slideCanvas.addEventListener('click', updateToolbarState);
+                 DOM.slideCanvas.addEventListener('keyup', updateToolbarState);
+             }
+        }
+
+        // --- Specifikus Eseménykezelő Függvények ---
+        function handleTitleClick() {
+            DOM.presentationTitle.contentEditable = true;
+            DOM.presentationTitle.focus();
+            DOM.presentationTitle.classList.add('editing');
+            // Select all text for easy editing
+            window.getSelection().selectAllChildren(DOM.presentationTitle);
+        }
+        function handleTitleBlur() {
+            DOM.presentationTitle.contentEditable = false;
+            DOM.presentationTitle.classList.remove('editing');
+            const newTitle = DOM.presentationTitle.textContent.trim();
+            if (newTitle && newTitle !== editorState.presentationTitle) {
+                editorState.presentationTitle = newTitle;
+                console.log("Cím megváltozott:", newTitle);
+                 markDirty(); // Title change is an unsaved change
+                 document.title = `${newTitle} - Szerkesztő`; // Update window title immediately
+            } else if (!newTitle && editorState.presentationTitle) {
+                 // Revert if empty
+                 DOM.presentationTitle.textContent = editorState.presentationTitle;
+            } else {
+                 // Ensure it's not left completely empty if it started that way
+                  DOM.presentationTitle.textContent = editorState.presentationTitle || CONFIG.DEFAULT_TITLE;
+            }
+            // Auto-save on title change? Optional.
+             // savePresentation();
+        }
+        function handleTitleKeydown(e) {
+            if (e.key === 'Enter') { e.preventDefault(); DOM.presentationTitle.blur(); }
+            else if (e.key === 'Escape') { e.preventDefault(); DOM.presentationTitle.textContent = editorState.presentationTitle; DOM.presentationTitle.blur(); }
+        }
+        function handleSlideListClick(event) {
+             const slideItem = event.target.closest('.slide-item');
+             const deleteButton = event.target.closest('.delete-slide-button');
+
+             if (deleteButton && deleteButton.dataset.slideId) {
+                 event.stopPropagation(); // Prevent selecting the slide when deleting
+                 deleteSlide(deleteButton.dataset.slideId);
+             } else if (slideItem && slideItem.dataset.slideId) {
+                 selectSlide(slideItem.dataset.slideId);
+             }
+         }
+         function handleSlideListKeydown(event) {
+             const currentItem = event.target.closest('.slide-item');
+             if (!currentItem) return;
+
+             if (event.key === 'Enter' || event.key === ' ') {
+                 event.preventDefault();
+                 selectSlide(currentItem.dataset.slideId);
+             } else if (event.key === 'Delete') {
+                 event.preventDefault();
+                 deleteSlide(currentItem.dataset.slideId);
+             }
+             // Basic Arrow Navigation (can be improved)
+             else if (event.key === 'ArrowDown') {
+                 event.preventDefault();
+                 const nextItem = currentItem.nextElementSibling;
+                 if (nextItem && nextItem.classList.contains('slide-item')) {
+                     nextItem.focus();
+                 }
+             } else if (event.key === 'ArrowUp') {
+                 event.preventDefault();
+                 const prevItem = currentItem.previousElementSibling;
+                 if (prevItem && prevItem.classList.contains('slide-item')) {
+                     prevItem.focus();
+                 }
+             }
+         }
+         function handleToolbarClick(event) {
+            const button = event.target.closest('button[data-command]');
+             if (button) {
+                 handleToolbarCommand({ currentTarget: button }); // Simulate event object structure
+             }
+             // Handle non-command buttons (dropdown triggers) if needed here
+             else {
+                 const dropdownTrigger = event.target.closest('.editor-toolbar-dropdown-trigger');
+                 if (dropdownTrigger) {
+                     // Logic to open font/size dropdowns would go here
+                     console.warn("Dropdown UI not implemented for:", dropdownTrigger.title);
+                 }
+             }
+         }
+         function handleCanvasInput(event) {
+             const target = event.target;
+             const field = target.dataset.field; // 'title', 'subtitle', 'content'
+
+             if (field) {
+                 const value = (field === 'content') ? target.innerHTML : target.value;
+                 const slideIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+
+                 if (slideIndex !== -1) {
+                      // Update state only if value actually changed
+                      if (editorState.slides[slideIndex][field] !== value) {
+                          editorState.slides[slideIndex][field] = value;
+                           markDirty(); // Mark changes
+                          if (field === 'title') {
+                               // Debounced sidebar update for title changes
+                               debounce(renderSidebar, 500)();
+                           }
+                      }
+                 }
+             }
+         }
+        const debouncedCanvasInputHandler = debounce(handleCanvasInput, CONFIG.DEBOUNCE_DELAY);
+
+         function handleCanvasFocusIn(event) {
+             // Update toolbar state when focusing within the canvas content editor
+             if (event.target && event.target.id === 'slide-content-editor') {
+                 updateToolbarState();
+             }
+         }
+         function handleRenameClick(e) {
+            e.preventDefault(); toggleMoreOptions();
+            if(DOM.presentationTitle) { DOM.presentationTitle.click(); } // Trigger click to start editing
+         }
+         function handleDuplicateClick(e) {
+            e.preventDefault(); toggleMoreOptions();
+            // TODO: Implement duplicate slide functionality
+             if (!editorState.selectedSlideId) return;
+             const currentSlideIndex = editorState.slides.findIndex(s => s.id === editorState.selectedSlideId);
+             if (currentSlideIndex === -1) return;
+
+             const currentSlide = editorState.slides[currentSlideIndex];
+             // Deep clone the slide object (simple way using JSON)
+             const newSlide = JSON.parse(JSON.stringify(currentSlide));
+             newSlide.id = generateUniqueId('slide'); // Give it a new ID
+             newSlide.title = `${currentSlide.title} (Másolat)`; // Append copy to title
+
+             editorState.slides.splice(currentSlideIndex + 1, 0, newSlide); // Insert after current
+             editorState.selectedSlideId = newSlide.id; // Select the new slide
+             markDirty();
+             renderSidebar();
+             renderCanvas();
+             console.log("Slide duplicated:", newSlide.id);
+         }
+         function handleOutsideDropdownClick(event) {
+             if (DOM.moreOptionsDropdown && !DOM.moreOptionsDropdown.classList.contains('hidden') &&
+                 DOM.moreOptionsButton && !DOM.moreOptionsButton.contains(event.target) &&
+                 !DOM.moreOptionsDropdown.contains(event.target)) {
+                 toggleMoreOptions();
+             }
+             // Add similar logic for Font/Size dropdowns when implemented
+         }
+         function handleGlobalKeydown(e) {
+             // Ctrl+S or Cmd+S for Save
+             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+                 e.preventDefault();
+                 savePresentation();
+             }
+             // Ctrl+Z / Ctrl+Y (basic support via execCommand)
+             else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+                  e.preventDefault();
+                  document.execCommand('undo');
+                  updateToolbarState(); // Update toolbar after undo
+                  markDirty();
+              }
+              else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
+                  e.preventDefault();
+                  document.execCommand('redo');
+                  updateToolbarState(); // Update toolbar after redo
+                  markDirty();
+              }
+              // Basic formatting shortcuts (ensure focus is in editor)
+             else if (document.activeElement === DOM.slideContentEditor) {
+                 if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') { e.preventDefault(); document.execCommand('bold'); updateToolbarState(); markDirty();}
+                 if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') { e.preventDefault(); document.execCommand('italic'); updateToolbarState(); markDirty();}
+                 if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'u') { e.preventDefault(); document.execCommand('underline'); updateToolbarState(); markDirty();}
+             }
+         }
+
+        // --- Inicializálás ---
+        function cacheDOMElements() {
+            DOM.saveButton = document.getElementById('save-button');
+            DOM.shareButton = document.getElementById('share-button');
+            DOM.presentButton = document.getElementById('present-button');
+            DOM.downloadButton = document.getElementById('download-button');
+            DOM.moreOptionsButton = document.getElementById('more-options-button');
+            DOM.presentationTitle = document.getElementById('presentation-title');
+            DOM.presentationLastEdited = document.getElementById('presentation-last-edited');
+            DOM.shareModal = document.getElementById('share-modal');
+            DOM.shareUrlInput = document.getElementById('share-url-input');
+            DOM.copyShareUrlButton = document.getElementById('copy-share-url-button');
+            DOM.closeShareModalButton = document.getElementById('close-share-modal-button');
+            DOM.moreOptionsDropdown = document.getElementById('more-options-dropdown');
+            DOM.renameOption = document.getElementById('rename-option');
+            DOM.duplicateOption = document.getElementById('duplicate-option');
+            DOM.historyOption = document.getElementById('history-option');
+            DOM.editorToolbar = document.getElementById('editor-toolbar');
+            DOM.slideList = document.getElementById('slide-list');
+            DOM.addSlideButton = document.getElementById('add-slide-button');
+            DOM.mainContentArea = document.querySelector('main[role="main"]'); // Added for fit zoom calculation
+            DOM.canvasScaler = document.getElementById('canvas-scaler');
+            DOM.slideCanvas = document.getElementById('slide-canvas');
+            // Canvas elements are cached within renderCanvas after creation
+            DOM.bottomBar = document.getElementById('bottom-bar');
+            DOM.prevSlideButton = document.getElementById('prev-slide-button');
+            DOM.nextSlideButton = document.getElementById('next-slide-button');
+            DOM.slideIndicator = document.getElementById('slide-indicator');
+            DOM.zoomOutButton = document.getElementById('zoom-out-button');
+            DOM.zoomInButton = document.getElementById('zoom-in-button');
+            DOM.zoomLevelSelect = document.getElementById('zoom-level');
+            DOM.fullscreenButton = document.getElementById('fullscreen-button');
+            DOM.fullscreenEnterIcon = document.getElementById('fullscreen-enter-icon');
+            DOM.fullscreenExitIcon = document.getElementById('fullscreen-exit-icon');
+            DOM.searchInput = document.getElementById('search-slides');
+            DOM.toolbarButtons = DOM.editorToolbar ? DOM.editorToolbar.querySelectorAll('button[data-command]') : [];
+             // Cache modal/dropdown content (simplified)
+             if (DOM.shareModal) { DOM.shareModal.innerHTML = ` <div class="bg-editor-light p-6 rounded-lg shadow-xl text-editor-main max-w-sm w-full"> <h3 class="text-lg font-medium mb-4">Prezentáció Megosztása</h3> <p class="text-sm text-editor-muted mb-2">Másold ki ezt a linket (ez csak egy példa):</p> <input id="share-url-input" type="text" readonly class="w-full bg-editor-dark p-2 rounded border border-editor-divider text-sm mb-4 focus:outline-none focus:ring-1 focus:ring-blue-500"> <div class="flex justify-end space-x-2"> <button id="copy-share-url-button" class="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm action-button">Másolás</button> <button id="close-share-modal-button" class="px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm action-button">Bezárás</button> </div> </div>`; }
+             if (DOM.moreOptionsDropdown) { DOM.moreOptionsDropdown.innerHTML = `<a href="#" id="rename-option" class="block px-4 py-2 text-sm text-editor-main hover:bg-editor-dark">Átnevezés</a><a href="#" id="duplicate-option" class="block px-4 py-2 text-sm text-editor-main hover:bg-editor-dark">Másolat készítése</a><a href="#" id="history-option" class="block px-4 py-2 text-sm text-editor-main hover:bg-editor-dark">Verzióelőzmények (Nincs imp.)</a>`; }
+              // Re-cache buttons inside modal/dropdown after setting innerHTML
+             DOM.shareUrlInput = document.getElementById('share-url-input');
+             DOM.copyShareUrlButton = document.getElementById('copy-share-url-button');
+             DOM.closeShareModalButton = document.getElementById('close-share-modal-button');
+             DOM.renameOption = document.getElementById('rename-option');
+             DOM.duplicateOption = document.getElementById('duplicate-option');
+             DOM.historyOption = document.getElementById('history-option');
+        }
+
+        // --- App Indítása ---
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log("DOM fully loaded and parsed");
+            cacheDOMElements();
+            loadPresentation(); // Load data and perform initial render
+            setupEventListeners();
+            applyZoom(); // Apply initial zoom
+            updateFullscreenButtonIcon(!!document.fullscreenElement); // Set initial fullscreen icon state
+        });
+
+         // Handle unsaved changes before leaving the page
+         window.addEventListener('beforeunload', (event) => {
+             if (editorState.isDirty) {
+                 event.preventDefault(); // Standard requires this line
+                 event.returnValue = 'Nem mentett változtatásaid vannak. Biztosan elhagyod az oldalt?'; // For older browsers
+                 return 'Nem mentett változtatásaid vannak. Biztosan elhagyod az oldalt?'; // For modern browsers
+             }
+         });
+
+    })(); // IIFE End
+ <!-- JavaScript Kód -->
